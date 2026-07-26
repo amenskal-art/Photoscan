@@ -171,7 +171,6 @@ object Pipeline {
             mesher?.release()
             tsdf?.release()
             egl.release()
-            neural?.close()
         }
     }
 
