@@ -31,6 +31,8 @@ class Tsdf(val n: Int, val origin: FloatArray, val voxel: Float) {
 
     private val clearSrc = """
         #version 310 es
+        precision highp float;
+        precision highp int;
         layout(local_size_x = 64) in;
         layout(std430, binding = 0) buffer Tsdf  { uint d[]; } vol;
         layout(std430, binding = 1) buffer Color { uint d[]; } col;
@@ -45,6 +47,8 @@ class Tsdf(val n: Int, val origin: FloatArray, val voxel: Float) {
 
     private val integrateSrc = """
         #version 310 es
+        precision highp float;
+        precision highp int;
         layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
         layout(std430, binding = 0) buffer Tsdf  { uint d[]; } vol;
@@ -121,7 +125,7 @@ class Tsdf(val n: Int, val origin: FloatArray, val voxel: Float) {
             float newT = (oldT * oldW + tsdf * w) / max(newW, 1e-6);
             newT = clamp(newT, -1.0, 1.0);
 
-            vol.d[idx] = (uint(newW) << 16) | (uint(int(newT * 32767.0)) & 65535u);
+            vol.d[idx] = (uint(newW) << 16) | uint(int(newT * 32767.0) & 65535);
 
             // Colour only matters within the band that will actually become geometry.
             if (uUseColor == 1 && abs(sdf) < uMu) {
@@ -156,8 +160,8 @@ class Tsdf(val n: Int, val origin: FloatArray, val voxel: Float) {
         }
         GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, 0)
 
-        clearProg = GlUtil.computeProgram(clearSrc)
-        integrateProg = GlUtil.computeProgram(integrateSrc)
+        clearProg = GlUtil.computeProgram(clearSrc, "volume clear")
+        integrateProg = GlUtil.computeProgram(integrateSrc, "depth fusion")
 
         depthTex = GlUtil.genTexture()
         confTex = GlUtil.genTexture()
