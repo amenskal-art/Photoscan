@@ -37,6 +37,13 @@ import kotlin.math.atan2
 import kotlin.math.min
 import kotlin.math.sqrt
 
+/** Edge length choices for the scan volume. Everything outside the box is ignored. */
+enum class RoiSize(val label: String, val half: Float) {
+    SMALL("30 cm", 0.15f),
+    MEDIUM("60 cm", 0.30f),
+    LARGE("1.2 m", 0.60f)
+}
+
 /** What the capture HUD needs to know, updated once per rendered frame. */
 class CaptureState {
     var tracking by mutableStateOf(false)
@@ -58,6 +65,10 @@ class CaptureState {
     var pointCount by mutableIntStateOf(0)
         internal set
 
+    /** True once the scan box has been anchored in the world by the first shot. */
+    var roiLocked by mutableStateOf(false)
+        internal set
+
     /** 36 azimuth bins around the subject, true once seen from that direction. */
     val coverage = BooleanArray(36)
     var coverageVersion by mutableIntStateOf(0)
@@ -67,23 +78,42 @@ class CaptureState {
 /**
  * Drives ARCore and decides when to take a shot.
  *
- * Nothing is captured continuously. A frame only becomes a keyframe when the camera has actually
- * moved enough to add new information — [TRANS_THRESHOLD] of baseline or [ROT_THRESHOLD] of
- * rotation — and only when the device is steady enough that the RGB frame will be sharp.
+ * Nothing is captured continuously, and rotating in place never fires the shutter: rotation carries
+ * no parallax, so a frame only becomes a keyframe when the camera has *travelled* — either
+ * [TRANS_THRESHOLD] outright, or [ROT_THRESHOLD] of rotation combined with at least
+ * [MIN_TRANS_FOR_ROT] of movement — and only when the device is steady enough to be sharp.
+ *
+ * The scan volume: the user aims a box (floating 45 cm ahead) at the subject. The first shot anchors
+ * it in world space at the median of the depth it sees. From then on the preview cloud, the coverage
+ * ring and the reconstruction all live strictly inside that box.
  */
 class ArEngine(private val context: Context) {
 
     companion object {
         const val TRANS_THRESHOLD = 0.045f          // metres of camera travel between shots
-        const val ROT_THRESHOLD = 7.0f              // degrees of camera rotation between shots
+        const val ROT_THRESHOLD = 10.0f             // degrees — only counts alongside real travel
+        const val MIN_TRANS_FOR_ROT = 0.020f        // metres of travel needed before rotation counts
         const val MAX_ANGULAR_SPEED = 40.0f         // deg/s above which frames are motion blurred
         const val MIN_INTERVAL_MS = 180L
         const val MAX_KEYFRAMES = 160
         const val PREVIEW_POINT_BUDGET = 220_000
         private const val PREVIEW_POINTS_PER_FRAME = 1600
+        private const val AIM_DISTANCE = 0.45f      // where the unanchored box floats, metres
     }
 
     val state = CaptureState()
+
+    /** Chosen on the scan screen; frozen into [lockedHalf] when the box anchors. */
+    var roiSize = RoiSize.MEDIUM
+
+    /** World-space centre of the anchored box. Valid when state.roiLocked. */
+    val roiCenter = FloatArray(3)
+
+    /** Follows the camera until the box anchors; what the renderer draws pre-lock. */
+    val roiPreviewCenter = FloatArray(3)
+
+    private var lockedHalf = RoiSize.MEDIUM.half
+    fun roiHalfNow(): Float = if (state.roiLocked) lockedHalf else roiSize.half
 
     var session: Session? = null
         private set
@@ -99,14 +129,14 @@ class ArEngine(private val context: Context) {
     private var lastFrameTimeNs = 0L
     private var lastShotMs = 0L
     private var angularSpeed = 0f
+    private val forwardLocal = floatArrayOf(0f, 0f, -1f)
+    private val forwardWorld = FloatArray(3)
 
     // --- live preview cloud ----------------------------------------------
     /** Interleaved x,y,z,r,g,b in world space. Read by the renderer on the same GL thread. */
     val previewPoints = FloatArray(PREVIEW_POINT_BUDGET * 6)
     @Volatile var previewCount = 0
         private set
-    private val centroid = FloatArray(3)
-    private var centroidSamples = 0
 
     private val scratchView = FloatArray(16)
     private val scratchModel = FloatArray(16)
@@ -135,16 +165,20 @@ class ArEngine(private val context: Context) {
         keyframes.clear()
         hasKey = false
         previewCount = 0
-        centroidSamples = 0
-        centroid.fill(0f)
         state.shots = 0
         state.pointCount = 0
+        state.roiLocked = false
+        lockedHalf = roiSize.half
         state.coverage.fill(false)
         state.coverageVersion++
     }
 
     fun finish(): Project? {
         val p = project ?: return null
+        if (state.roiLocked) {
+            p.roiCenter = roiCenter.copyOf()
+            p.roiHalf = lockedHalf
+        }
         p.saveMeta(keyframes)
         return p
     }
@@ -177,6 +211,14 @@ class ArEngine(private val context: Context) {
         val pos = floatArrayOf(pose.tx(), pose.ty(), pose.tz())
         val quat = pose.rotationQuaternion
 
+        // Keep the aiming box floating ahead of the camera until it anchors.
+        if (!state.roiLocked) {
+            pose.rotateVector(forwardLocal, 0, forwardWorld, 0)
+            roiPreviewCenter[0] = pos[0] + forwardWorld[0] * AIM_DISTANCE
+            roiPreviewCenter[1] = pos[1] + forwardWorld[1] * AIM_DISTANCE
+            roiPreviewCenter[2] = pos[2] + forwardWorld[2] * AIM_DISTANCE
+        }
+
         // Angular speed drives the blur guard.
         val prevQ = lastFrameQuat
         val dtNs = frame.timestamp - lastFrameTimeNs
@@ -197,7 +239,12 @@ class ArEngine(private val context: Context) {
 
         val dTrans = dist(pos, lastKeyPos)
         val dRot = quatAngleDeg(lastKeyQuat, quat)
-        val progress = maxOf(dTrans / TRANS_THRESHOLD, dRot / ROT_THRESHOLD).coerceIn(0f, 1f)
+
+        // Translation is the real trigger. Rotation only helps once you have actually moved,
+        // so turning in place shows no progress and fires nothing.
+        val transP = dTrans / TRANS_THRESHOLD
+        val rotP = if (dTrans >= MIN_TRANS_FOR_ROT) dRot / ROT_THRESHOLD else 0f
+        val progress = maxOf(transP, rotP).coerceIn(0f, 1f)
         state.armProgress = progress
 
         val now = System.currentTimeMillis()
@@ -238,17 +285,23 @@ class ArEngine(private val context: Context) {
             val sy = dh.toFloat() / dims[1]
             val fl = intr.focalLength
             val pp = intr.principalPoint
+            val fx = fl[0] * sx; val fy = fl[1] * sy
+            val cxp = pp[0] * sx; val cyp = pp[1] * sy
 
             cam.getViewMatrix(scratchView, 0)
             cam.pose.toMatrix(scratchModel, 0)
+
+            // The first shot anchors the scan box at the median of the depth it sees.
+            if (!state.roiLocked) {
+                lockRoi(depth, conf, dw, dh, fx, fy, cxp, cyp, scratchModel)
+            }
 
             val kf = Keyframe(
                 index = keyframes.size,
                 timestampNs = frame.timestamp,
                 viewMatrix = scratchView.copyOf(),
                 camPosition = pos.copyOf(),
-                fx = fl[0] * sx, fy = fl[1] * sy,
-                cx = pp[0] * sx, cy = pp[1] * sy,
+                fx = fx, fy = fy, cx = cxp, cy = cyp,
                 depthWidth = dw, depthHeight = dh
             )
             keyframes.add(kf)
@@ -270,6 +323,54 @@ class ArEngine(private val context: Context) {
         } finally {
             depthImage?.close(); confImage?.close(); rgbImage?.close()
         }
+    }
+
+    /** Anchor the box: median world point of the central half of this frame's confident depth. */
+    private fun lockRoi(
+        depth: ShortArray, conf: ByteArray, dw: Int, dh: Int,
+        fx: Float, fy: Float, cx: Float, cy: Float, model: FloatArray
+    ) {
+        val xs = ArrayList<Float>(700); val ys = ArrayList<Float>(700); val zs = ArrayList<Float>(700)
+        val v = FloatArray(4); val o = FloatArray(4)
+        val x0 = dw / 4; val x1 = dw * 3 / 4
+        val y0 = dh / 4; val y1 = dh * 3 / 4
+        val stepX = maxOf(1, (x1 - x0) / 26)
+        val stepY = maxOf(1, (y1 - y0) / 26)
+        var py = y0
+        while (py < y1) {
+            var px = x0
+            while (px < x1) {
+                val k = py * dw + px
+                if (k < depth.size) {
+                    val raw = depth[k].toInt() and 0xFFFF
+                    val c = if (k < conf.size) conf[k].toInt() and 0xFF else 0
+                    if (raw != 0 && c > 60) {
+                        val d = raw * 0.001f
+                        if (d in 0.15f..2.5f) {
+                            v[0] = (px - cx) / fx * d
+                            v[1] = -((py - cy) / fy * d)
+                            v[2] = -d
+                            v[3] = 1f
+                            Matrix.multiplyMV(o, 0, model, 0, v, 0)
+                            xs.add(o[0]); ys.add(o[1]); zs.add(o[2])
+                        }
+                    }
+                }
+                px += stepX
+            }
+            py += stepY
+        }
+
+        if (xs.size >= 30) {
+            xs.sort(); ys.sort(); zs.sort()
+            roiCenter[0] = xs[xs.size / 2]
+            roiCenter[1] = ys[ys.size / 2]
+            roiCenter[2] = zs[zs.size / 2]
+        } else {
+            System.arraycopy(roiPreviewCenter, 0, roiCenter, 0, 3)
+        }
+        lockedHalf = roiSize.half
+        state.roiLocked = true
     }
 
     // ---------------------------------------------------------------------
@@ -367,13 +468,16 @@ class ArEngine(private val context: Context) {
     private fun addPreviewPoints(depth: ShortArray, conf: ByteArray, kf: Keyframe, model: FloatArray) {
         val total = kf.depthWidth * kf.depthHeight
         val stride = maxOf(1, total / PREVIEW_POINTS_PER_FRAME)
+        val locked = state.roiLocked
+        val bh = lockedHalf * 1.05f
+        val confMin = if (locked) 60 else 90
         val v = FloatArray(4)
         val outV = FloatArray(4)
         var i = 0
         var written = previewCount
         while (i < total && written < PREVIEW_POINT_BUDGET) {
-            val raw = depth[i].toInt() and 0x1FFF
-            if (raw != 0 && (conf[i].toInt() and 0xFF) > 90) {
+            val raw = depth[i].toInt() and 0xFFFF
+            if (raw != 0 && (conf[i].toInt() and 0xFF) > confMin) {
                 val d = raw * 0.001f
                 if (d in 0.15f..4.0f) {
                     val px = i % kf.depthWidth
@@ -384,18 +488,22 @@ class ArEngine(private val context: Context) {
                     v[2] = -d
                     v[3] = 1f
                     Matrix.multiplyMV(outV, 0, model, 0, v, 0)
-                    val b = written * 6
-                    previewPoints[b] = outV[0]
-                    previewPoints[b + 1] = outV[1]
-                    previewPoints[b + 2] = outV[2]
-                    // Depth-cued colour so the cloud reads as shape, not noise.
-                    val t = ((d - 0.2f) / 1.8f).coerceIn(0f, 1f)
-                    previewPoints[b + 3] = 0.30f + 0.55f * (1f - t)
-                    previewPoints[b + 4] = 0.88f - 0.25f * t
-                    previewPoints[b + 5] = 0.70f + 0.25f * t
-                    centroid[0] += outV[0]; centroid[1] += outV[1]; centroid[2] += outV[2]
-                    centroidSamples++
-                    written++
+                    val inside = !locked ||
+                            (abs(outV[0] - roiCenter[0]) <= bh &&
+                             abs(outV[1] - roiCenter[1]) <= bh &&
+                             abs(outV[2] - roiCenter[2]) <= bh)
+                    if (inside) {
+                        val b = written * 6
+                        previewPoints[b] = outV[0]
+                        previewPoints[b + 1] = outV[1]
+                        previewPoints[b + 2] = outV[2]
+                        // Depth-cued colour so the cloud reads as shape, not noise.
+                        val t = ((d - 0.2f) / 1.8f).coerceIn(0f, 1f)
+                        previewPoints[b + 3] = 0.30f + 0.55f * (1f - t)
+                        previewPoints[b + 4] = 0.88f - 0.25f * t
+                        previewPoints[b + 5] = 0.70f + 0.25f * t
+                        written++
+                    }
                 }
             }
             i += stride
@@ -405,10 +513,10 @@ class ArEngine(private val context: Context) {
     }
 
     private fun updateCoverage(camPos: FloatArray) {
-        if (centroidSamples < 100) return
-        val cx = centroid[0] / centroidSamples
-        val cz = centroid[2] / centroidSamples
-        var a = Math.toDegrees(atan2((camPos[2] - cz).toDouble(), (camPos[0] - cx).toDouble())).toFloat()
+        if (!state.roiLocked) return
+        var a = Math.toDegrees(
+            atan2((camPos[2] - roiCenter[2]).toDouble(), (camPos[0] - roiCenter[0]).toDouble())
+        ).toFloat()
         if (a < 0) a += 360f
         val bin = ((a / 10f).toInt()).coerceIn(0, 35)
         if (!state.coverage[bin]) {
