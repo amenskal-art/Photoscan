@@ -77,14 +77,28 @@ object Pipeline {
             mesher = Mesher(tsdf)
             mesher.prepare()
 
+            val minWeight = 0.75f
             val builder = MeshBuilder(voxel * 0.35f)
-            mesher.extract(builder, minWeight = 1.2f) { p ->
+            mesher.extract(builder, minWeight = minWeight) { p ->
                 emit(ReconProgress.Stage("Building surface", 0.68f + 0.22f * p))
             }
 
             var mesh = builder.build()
             if (mesh.triangleCount == 0) {
-                emit(ReconProgress.Failed("Nothing solid was found. Try scanning closer, with more overlap."))
+                // Say where the data died, not just that it did.
+                val (observed, nearSurface) = tsdf.stats(minWeight)
+                val msg = when {
+                    observed == 0 ->
+                        "Fusion produced an empty volume (0 of ${tsdf.voxelCount} voxels observed). " +
+                            "This is a bug in the app, not in your scanning — please report it with your phone model."
+                    nearSurface == 0 ->
+                        "$observed voxels were observed but no surface crossing was found. " +
+                            "This is a bug in the app, not in your scanning — please report it with your phone model."
+                    else ->
+                        "A surface exists ($nearSurface voxels) but meshing produced no triangles. " +
+                            "This is a bug in the app, not in your scanning — please report it with your phone model."
+                }
+                emit(ReconProgress.Failed(msg))
                 return
             }
 
