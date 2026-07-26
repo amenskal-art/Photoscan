@@ -57,7 +57,7 @@ class Mesher(private val tsdf: Tsdf) {
             uint p = vol.d[vi(c)];
             return float((int(p & 65535u) << 16) >> 16) / 32767.0;
         }
-        float wAt(ivec3 c) { return float(vol.d[vi(c)] >> 16); }
+        float wAt(ivec3 c) { return float(vol.d[vi(c)] >> 16) / 64.0; }   // weights stored in 64ths
 
         vec3 colAt(ivec3 c) {
             uint p = col.d[vi(c)];
