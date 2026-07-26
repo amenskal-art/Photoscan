@@ -180,11 +180,12 @@ object Pipeline {
         val w: Int, val h: Int, val fx: Float, val fy: Float, val cx: Float, val cy: Float
     )
 
-    /** RGB-image intrinsics, deriving them from depth intrinsics + JPEG bounds for old scans. */
+    /**
+     * Intrinsics for the captured photo, derived from the stored depth intrinsics scaled by the
+     * JPEG's real dimensions. Same lens and same field of view, so the scale factor is exact —
+     * which means this needs nothing recorded beyond what every scan already has.
+     */
     private fun rgbIntrinsics(p: Project, kf: Keyframe): RgbIntr {
-        if (kf.rgbWidth > 0 && kf.rgbHeight > 0 && kf.rgbFx > 0f) {
-            return RgbIntr(kf.rgbWidth, kf.rgbHeight, kf.rgbFx, kf.rgbFy, kf.rgbCx, kf.rgbCy)
-        }
         val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(p.rgbFile(kf.index).absolutePath, opts)
         if (opts.outWidth <= 0 || opts.outHeight <= 0) return RgbIntr(0, 0, 0f, 0f, 0f, 0f)
