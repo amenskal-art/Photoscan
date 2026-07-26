@@ -126,8 +126,8 @@ class MeshRenderer : GLSurfaceView.Renderer {
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES31.glClearColor(0.031f, 0.039f, 0.059f, 1f)
         GLES31.glEnable(GLES31.GL_DEPTH_TEST)
-        meshProg = GlUtil.program(meshVs, meshFs)
-        gridProg = GlUtil.program(gridVs, gridFs)
+        meshProg = GlUtil.program(meshVs, meshFs, "model")
+        gridProg = GlUtil.program(gridVs, gridFs, "grid")
         buildGrid()
         uploadPending = true
     }
