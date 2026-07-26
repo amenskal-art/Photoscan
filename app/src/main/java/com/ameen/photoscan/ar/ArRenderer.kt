@@ -97,8 +97,8 @@ class ArRenderer(
         GLES31.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES31.GL_TEXTURE_MIN_FILTER, GLES31.GL_LINEAR)
         GLES31.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES31.GL_TEXTURE_MAG_FILTER, GLES31.GL_LINEAR)
 
-        bgProgram = GlUtil.program(bgVs, bgFs)
-        pcProgram = GlUtil.program(pcVs, pcFs)
+        bgProgram = GlUtil.program(bgVs, bgFs, "camera background")
+        pcProgram = GlUtil.program(pcVs, pcFs, "point cloud")
 
         pcVbo = GlUtil.genBuffer()
         GLES31.glBindBuffer(GLES31.GL_ARRAY_BUFFER, pcVbo)
