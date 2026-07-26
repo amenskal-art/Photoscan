@@ -1,10 +1,19 @@
 name: Build APK
 
+# Manual only. Push and pull_request triggers are deliberately absent, so editing files
+# never starts a build. Run it from the Actions tab: pick "Build APK", then "Run workflow".
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
   workflow_dispatch:
+    inputs:
+      variant:
+        description: "Which APK to build"
+        required: true
+        default: debug
+        type: choice
+        options:
+          - debug
+          - release
+          - both
 
 jobs:
   build:
@@ -29,12 +38,15 @@ jobs:
           gradle-version: '8.10.2'
 
       - name: Build debug APK
+        if: github.event.inputs.variant == 'debug' || github.event.inputs.variant == 'both'
         run: gradle :app:assembleDebug --no-daemon --stacktrace
 
       - name: Build release APK (unsigned)
+        if: github.event.inputs.variant == 'release' || github.event.inputs.variant == 'both'
         run: gradle :app:assembleRelease --no-daemon --stacktrace
 
       - name: Upload debug APK
+        if: github.event.inputs.variant == 'debug' || github.event.inputs.variant == 'both'
         uses: actions/upload-artifact@v4
         with:
           name: photoscan-debug
@@ -42,8 +54,9 @@ jobs:
           if-no-files-found: error
 
       - name: Upload release APK
+        if: github.event.inputs.variant == 'release' || github.event.inputs.variant == 'both'
         uses: actions/upload-artifact@v4
         with:
           name: photoscan-release-unsigned
           path: app/build/outputs/apk/release/*.apk
-          if-no-files-found: warn
+          if-no-files-found: error
