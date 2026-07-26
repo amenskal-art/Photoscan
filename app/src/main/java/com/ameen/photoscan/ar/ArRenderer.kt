@@ -29,6 +29,8 @@ class ArRenderer(
     private var bgProgram = 0
     private var pcProgram = 0
     private var pcVbo = 0
+    private var boxProgram = 0
+    private var boxVbo = 0
 
     private val ndcBuffer: FloatBuffer = GlUtil.floatBuffer(
         floatArrayOf(-1f, -1f, +1f, -1f, -1f, +1f, +1f, +1f)
@@ -87,6 +89,23 @@ class ArRenderer(
         }
     """.trimIndent()
 
+    private val boxVs = """
+        #version 300 es
+        in vec3 aPos;
+        uniform mat4 uViewProj;
+        uniform vec3 uCenter;
+        uniform float uHalf;
+        void main() { gl_Position = uViewProj * vec4(uCenter + aPos * uHalf, 1.0); }
+    """.trimIndent()
+
+    private val boxFs = """
+        #version 300 es
+        precision mediump float;
+        uniform vec4 uColor;
+        out vec4 frag;
+        void main() { frag = uColor; }
+    """.trimIndent()
+
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES31.glClearColor(0.03f, 0.04f, 0.06f, 1f)
 
@@ -99,6 +118,24 @@ class ArRenderer(
 
         bgProgram = GlUtil.program(bgVs, bgFs, "camera background")
         pcProgram = GlUtil.program(pcVs, pcFs, "point cloud")
+        boxProgram = GlUtil.program(boxVs, boxFs, "scan box")
+
+        // 12 edges of a unit cube as a line list.
+        val c = floatArrayOf(-1f, 1f)
+        val edges = ArrayList<Float>(72)
+        fun add(x: Float, y: Float, z: Float) { edges.add(x); edges.add(y); edges.add(z) }
+        for (y in c) {                       // top and bottom rings
+            add(-1f, y, -1f); add(1f, y, -1f)
+            add(1f, y, -1f);  add(1f, y, 1f)
+            add(1f, y, 1f);   add(-1f, y, 1f)
+            add(-1f, y, 1f);  add(-1f, y, -1f)
+        }
+        for (x in c) for (z in c) { add(x, -1f, z); add(x, 1f, z) }   // verticals
+        boxVbo = GlUtil.genBuffer()
+        GLES31.glBindBuffer(GLES31.GL_ARRAY_BUFFER, boxVbo)
+        val boxData = GlUtil.floatBuffer(edges.toFloatArray())
+        GLES31.glBufferData(GLES31.GL_ARRAY_BUFFER, edges.size * 4, boxData, GLES31.GL_STATIC_DRAW)
+        GLES31.glBindBuffer(GLES31.GL_ARRAY_BUFFER, 0)
 
         pcVbo = GlUtil.genBuffer()
         GLES31.glBindBuffer(GLES31.GL_ARRAY_BUFFER, pcVbo)
@@ -150,6 +187,7 @@ class ArRenderer(
             cam.getViewMatrix(view, 0)
             cam.getProjectionMatrix(proj, 0, 0.05f, 12f)
             Matrix.multiplyMM(viewProj, 0, proj, 0, view, 0)
+            drawBox()
             drawPoints()
 
             onFrameDrawn()
@@ -180,6 +218,35 @@ class ArRenderer(
 
         GLES31.glDepthMask(true)
         GLES31.glEnable(GLES31.GL_DEPTH_TEST)
+    }
+
+    private fun drawBox() {
+        if (!engine.state.tracking) return
+        val locked = engine.state.roiLocked
+        val center = if (locked) engine.roiCenter else engine.roiPreviewCenter
+        val half = engine.roiHalfNow()
+
+        GLES31.glEnable(GLES31.GL_BLEND)
+        GLES31.glBlendFunc(GLES31.GL_SRC_ALPHA, GLES31.GL_ONE_MINUS_SRC_ALPHA)
+        GLES31.glUseProgram(boxProgram)
+        GLES31.glUniformMatrix4fv(GLES31.glGetUniformLocation(boxProgram, "uViewProj"), 1, false, viewProj, 0)
+        GLES31.glUniform3f(GLES31.glGetUniformLocation(boxProgram, "uCenter"), center[0], center[1], center[2])
+        GLES31.glUniform1f(GLES31.glGetUniformLocation(boxProgram, "uHalf"), half)
+        if (locked) {
+            GLES31.glUniform4f(GLES31.glGetUniformLocation(boxProgram, "uColor"), 0.30f, 0.88f, 0.70f, 0.85f)
+        } else {
+            GLES31.glUniform4f(GLES31.glGetUniformLocation(boxProgram, "uColor"), 1.00f, 0.71f, 0.33f, 0.75f)
+        }
+        GLES31.glLineWidth(3f)
+
+        GLES31.glBindBuffer(GLES31.GL_ARRAY_BUFFER, boxVbo)
+        val aPos = GLES31.glGetAttribLocation(boxProgram, "aPos")
+        GLES31.glVertexAttribPointer(aPos, 3, GLES31.GL_FLOAT, false, 12, 0)
+        GLES31.glEnableVertexAttribArray(aPos)
+        GLES31.glDrawArrays(GLES31.GL_LINES, 0, 24)
+        GLES31.glDisableVertexAttribArray(aPos)
+        GLES31.glBindBuffer(GLES31.GL_ARRAY_BUFFER, 0)
+        GLES31.glDisable(GLES31.GL_BLEND)
     }
 
     private fun drawPoints() {
