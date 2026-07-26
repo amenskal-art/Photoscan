@@ -1,5 +1,6 @@
 package com.ameen.photoscan.recon
 
+import android.opengl.GLES30
 import android.opengl.GLES31
 import com.ameen.photoscan.gl.GlUtil
 import java.nio.ByteBuffer
@@ -13,8 +14,13 @@ import java.nio.ByteOrder
  * to fuse 150 frames in a few seconds on a phone GPU.
  *
  * Layout, both buffers indexed by z*N*N + y*N + x:
- *   tsdf[i]  = weight(16) | signedDistanceFixed(16)   distance normalised to [-1,1] over the truncation band
- *   color[i] = weight(8) | b(8) | g(8) | r(8)
+ *   tsdf[i]  = weightFixed(16) | signedDistanceFixed(16)
+ *              weight is stored in 64ths so fractional per-frame weights accumulate; distance is
+ *              normalised to [-1,1] over the truncation band in 32767ths
+ *   color[i] = colorWeightFixed(8, in 16ths) | b(8) | g(8) | r(8)
+ *
+ * The fixed-point weights matter: per-frame weights are well below 1, and storing them as whole
+ * numbers floors the sum back to zero on every write, leaving the whole volume "unobserved".
  */
 class Tsdf(val n: Int, val origin: FloatArray, val voxel: Float) {
 
@@ -25,6 +31,8 @@ class Tsdf(val n: Int, val origin: FloatArray, val voxel: Float) {
 
     private var integrateProg = 0
     private var clearProg = 0
+    private var statsProg = 0
+    private var statsBuf = 0
     private var depthTex = 0
     private var confTex = 0
     private var colorTex = 0
@@ -37,11 +45,34 @@ class Tsdf(val n: Int, val origin: FloatArray, val voxel: Float) {
         layout(std430, binding = 0) buffer Tsdf  { uint d[]; } vol;
         layout(std430, binding = 1) buffer Color { uint d[]; } col;
         uniform int uCount;
+        uniform int uOffset;
         void main() {
-            uint i = gl_GlobalInvocationID.x;
+            uint i = gl_GlobalInvocationID.x + uint(uOffset);
             if (i >= uint(uCount)) return;
             vol.d[i] = 0u;
             col.d[i] = 0u;
+        }
+    """.trimIndent()
+
+    private val statsSrc = """
+        #version 310 es
+        precision highp float;
+        precision highp int;
+        layout(local_size_x = 64) in;
+        layout(std430, binding = 0) readonly buffer Tsdf { uint d[]; } vol;
+        layout(std430, binding = 1) buffer Stats { uint observed; uint nearSurface; } st;
+        uniform int uCount;
+        uniform int uOffset;
+        uniform float uMinWeight;
+        void main() {
+            uint i = gl_GlobalInvocationID.x + uint(uOffset);
+            if (i >= uint(uCount)) return;
+            uint p = vol.d[i];
+            float w = float(p >> 16) / 64.0;
+            if (w < uMinWeight) return;
+            atomicAdd(st.observed, 1u);
+            float t = float((int(p & 65535u) << 16) >> 16) / 32767.0;
+            if (abs(t) < 0.98) atomicAdd(st.nearSurface, 1u);
         }
     """.trimIndent()
 
@@ -71,7 +102,7 @@ class Tsdf(val n: Int, val origin: FloatArray, val voxel: Float) {
         uniform int   uUseColor;
 
         float depthAt(ivec2 p) {
-            uint raw = texelFetch(uDepth, p, 0).r & 8191u;   // low 13 bits are millimetres
+            uint raw = texelFetch(uDepth, p, 0).r;
             return float(raw) * 0.001;
         }
 
@@ -97,14 +128,18 @@ class Tsdf(val n: Int, val origin: FloatArray, val voxel: Float) {
             float conf = float(texelFetch(uConf, px, 0).r) / 255.0;
             if (conf < uMinConf) return;
 
-            // Reject silhouette pixels. A large local depth gradient means this texel straddles an
-            // edge, and interpolating across it is what produces flying-pixel skirts.
+            // Reject silhouette pixels: a large depth step to any *valid* neighbour means this texel
+            // straddles an edge. Raw depth is sparse, so a missing neighbour is normal and must not
+            // reject the sample by itself.
+            float grad = 0.0;
             float dl = depthAt(px + ivec2(-1, 0));
             float dr = depthAt(px + ivec2( 1, 0));
             float du = depthAt(px + ivec2( 0,-1));
             float dd = depthAt(px + ivec2( 0, 1));
-            float grad = max(max(abs(dl - d), abs(dr - d)), max(abs(du - d), abs(dd - d)));
-            if (dl <= 0.0 || dr <= 0.0 || du <= 0.0 || dd <= 0.0) return;
+            if (dl > 0.0) grad = max(grad, abs(dl - d));
+            if (dr > 0.0) grad = max(grad, abs(dr - d));
+            if (du > 0.0) grad = max(grad, abs(du - d));
+            if (dd > 0.0) grad = max(grad, abs(dd - d));
             if (grad > 0.06 + 0.03 * d) return;
 
             float sdf = d - z;
@@ -112,34 +147,35 @@ class Tsdf(val n: Int, val origin: FloatArray, val voxel: Float) {
 
             float tsdf = clamp(sdf / uMu, -1.0, 1.0);
 
-            // Near measurements are far more trustworthy than far ones.
-            float falloff = clamp(1.0 / (1.0 + 6.0 * (d - uMinDepth) * (d - uMinDepth)), 0.08, 1.0);
+            // Near measurements are more trustworthy than far ones.
+            float falloff = clamp(1.0 / (1.0 + 6.0 * (d - uMinDepth) * (d - uMinDepth)), 0.15, 1.0);
             float w = conf * falloff;
             if (w <= 0.0) return;
 
             uint packed = vol.d[idx];
-            float oldW = float(packed >> 16);
+            float oldW = float(packed >> 16) / 64.0;
             float oldT = float((int(packed & 65535u) << 16) >> 16) / 32767.0;
 
             float newW = min(oldW + w, 250.0);
             float newT = (oldT * oldW + tsdf * w) / max(newW, 1e-6);
             newT = clamp(newT, -1.0, 1.0);
 
-            vol.d[idx] = (uint(newW) << 16) | uint(int(newT * 32767.0) & 65535);
+            uint wq = uint(newW * 64.0 + 0.5);
+            vol.d[idx] = (wq << 16) | uint(int(newT * 32767.0) & 65535);
 
             // Colour only matters within the band that will actually become geometry.
             if (uUseColor == 1 && abs(sdf) < uMu) {
                 vec2 uv = vec2((u + 0.5) / float(uDepthSize.x), (v + 0.5) / float(uDepthSize.y));
                 vec3 c = texture(uColor, uv).rgb;
                 uint pc0 = col.d[idx];
-                float cw = float((pc0 >> 24) & 255u);
+                float cw = float((pc0 >> 24) & 255u) / 16.0;
                 vec3 oldC = vec3(float(pc0 & 255u), float((pc0 >> 8) & 255u), float((pc0 >> 16) & 255u)) / 255.0;
-                float ncw = min(cw + w, 250.0);
+                float ncw = min(cw + w, 15.0);
                 vec3 nc = (oldC * cw + c * w) / max(ncw, 1e-6);
                 col.d[idx] = uint(clamp(nc.r, 0.0, 1.0) * 255.0)
                            | (uint(clamp(nc.g, 0.0, 1.0) * 255.0) << 8)
                            | (uint(clamp(nc.b, 0.0, 1.0) * 255.0) << 16)
-                           | (uint(ncw) << 24);
+                           | (uint(ncw * 16.0 + 0.5) << 24);
             }
         }
     """.trimIndent()
@@ -158,9 +194,14 @@ class Tsdf(val n: Int, val origin: FloatArray, val voxel: Float) {
                 throw OutOfMemoryError("GPU refused a ${bytes / (1024 * 1024)} MB voxel buffer. Try a lower quality.")
             }
         }
+
+        statsBuf = GlUtil.genBuffer()
+        GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, statsBuf)
+        GLES31.glBufferData(GLES31.GL_SHADER_STORAGE_BUFFER, 8, null, GLES31.GL_DYNAMIC_COPY)
         GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, 0)
 
         clearProg = GlUtil.computeProgram(clearSrc, "volume clear")
+        statsProg = GlUtil.computeProgram(statsSrc, "volume stats")
         integrateProg = GlUtil.computeProgram(integrateSrc, "depth fusion")
 
         depthTex = GlUtil.genTexture()
@@ -178,21 +219,56 @@ class Tsdf(val n: Int, val origin: FloatArray, val voxel: Float) {
         clear()
     }
 
+    /** Runs [prog] over the whole volume in chunks that respect the 65535 work-group dispatch limit. */
+    private fun dispatchOverVolume(prog: Int) {
+        val groups = (voxelCount + 63) / 64
+        val maxGroups = 65535
+        var doneGroups = 0
+        while (doneGroups < groups) {
+            val batch = minOf(maxGroups, groups - doneGroups)
+            GLES31.glUniform1i(GLES31.glGetUniformLocation(prog, "uOffset"), doneGroups * 64)
+            GLES31.glDispatchCompute(batch, 1, 1)
+            doneGroups += batch
+        }
+    }
+
     private fun clear() {
         GLES31.glUseProgram(clearProg)
         GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, tsdfBuf)
         GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 1, colorBuf)
         GLES31.glUniform1i(GLES31.glGetUniformLocation(clearProg, "uCount"), voxelCount)
-        val groups = (voxelCount + 63) / 64
-        var done = 0
-        // Split into chunks so we never exceed the per-dispatch work group limit.
-        val maxGroups = 65535
-        while (done < groups) {
-            val batch = minOf(maxGroups, groups - done)
-            GLES31.glDispatchCompute(batch, 1, 1)
-            done += batch
-        }
+        dispatchOverVolume(clearProg)
         GLES31.glMemoryBarrier(GLES31.GL_SHADER_STORAGE_BARRIER_BIT)
+    }
+
+    /**
+     * Diagnostic: how many voxels were observed at all, and how many sit near a surface crossing.
+     * Cheap one-shot pass; used to say something useful when meshing produces nothing.
+     */
+    fun stats(minWeight: Float): Pair<Int, Int> {
+        val zero = ByteBuffer.allocateDirect(8).order(ByteOrder.nativeOrder())
+        zero.putInt(0); zero.putInt(0); zero.position(0)
+        GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, statsBuf)
+        GLES31.glBufferSubData(GLES31.GL_SHADER_STORAGE_BUFFER, 0, 8, zero)
+
+        GLES31.glUseProgram(statsProg)
+        GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, tsdfBuf)
+        GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 1, statsBuf)
+        GLES31.glUniform1i(GLES31.glGetUniformLocation(statsProg, "uCount"), voxelCount)
+        GLES31.glUniform1f(GLES31.glGetUniformLocation(statsProg, "uMinWeight"), minWeight)
+        dispatchOverVolume(statsProg)
+        GLES31.glMemoryBarrier(GLES31.GL_SHADER_STORAGE_BARRIER_BIT or GLES31.GL_BUFFER_UPDATE_BARRIER_BIT)
+
+        GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, statsBuf)
+        val b = GLES30.glMapBufferRange(
+            GLES31.GL_SHADER_STORAGE_BUFFER, 0, 8, GLES30.GL_MAP_READ_BIT
+        ) as? ByteBuffer ?: return 0 to 0
+        val bb = b.order(ByteOrder.nativeOrder())
+        val observed = bb.int
+        val near = bb.int
+        GLES30.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER)
+        GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, 0)
+        return observed to near
     }
 
     /**
@@ -282,9 +358,11 @@ class Tsdf(val n: Int, val origin: FloatArray, val voxel: Float) {
 
     fun release() {
         if (tsdfBuf != 0) GLES31.glDeleteBuffers(2, intArrayOf(tsdfBuf, colorBuf), 0)
+        if (statsBuf != 0) GLES31.glDeleteBuffers(1, intArrayOf(statsBuf), 0)
         if (integrateProg != 0) GLES31.glDeleteProgram(integrateProg)
         if (clearProg != 0) GLES31.glDeleteProgram(clearProg)
+        if (statsProg != 0) GLES31.glDeleteProgram(statsProg)
         GLES31.glDeleteTextures(3, intArrayOf(depthTex, confTex, colorTex), 0)
-        tsdfBuf = 0; colorBuf = 0
+        tsdfBuf = 0; colorBuf = 0; statsBuf = 0
     }
 }
