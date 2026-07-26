@@ -38,6 +38,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.ameen.photoscan.ar.ArEngine
 import com.ameen.photoscan.ar.ArRenderer
+import com.ameen.photoscan.ar.RoiSize
 import com.ameen.photoscan.data.Project
 import com.ameen.photoscan.data.ProjectStore
 import com.google.ar.core.ArCoreApk
@@ -57,6 +58,7 @@ fun ScanScreen(
     val engine = remember { ArEngine(ctx) }
     val project = remember { ProjectStore.create(ctx) }
     var error by remember { mutableStateOf<String?>(null) }
+    var sizeIdx by remember { mutableStateOf(1) }
     var installRequested by remember { mutableStateOf(false) }
     var sessionStarted by remember { mutableStateOf(false) }
 
@@ -190,6 +192,18 @@ fun ScanScreen(
             )
             Spacer(Modifier.height(14.dp))
 
+            if (!s.roiLocked) {
+                SegmentedRow(
+                    options = listOf("30 CM", "60 CM", "1.2 M"),
+                    selectedIndex = sizeIdx,
+                    onSelect = {
+                        sizeIdx = it
+                        engine.roiSize = RoiSize.entries[it]
+                    }
+                )
+                Spacer(Modifier.height(14.dp))
+            }
+
             CaptureDial(
                 shots = s.shots,
                 armProgress = s.armProgress,
@@ -249,9 +263,9 @@ fun ScanScreen(
 
 private fun guidance(s: com.ameen.photoscan.ar.CaptureState, engine: ArEngine): String = when {
     !s.tracking -> s.failureReason ?: "Finding your position"
-    s.shots == 0 -> "Point at the object, then start moving around it"
+    s.shots == 0 -> "Fit the box over the object — the first shot pins it in place"
     s.tooFast -> "Slow down so the shots stay sharp"
-    s.shots < 20 -> "Keep circling. Hold the same distance."
+    s.shots < 20 -> "Circle it with side-steps — turning in place doesn't count"
     else -> "${engine.coveragePercent()}% covered · fill the gaps in the ring"
 }
 
