@@ -1,6 +1,5 @@
 package com.ameen.photoscan.recon
 
-import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.opengl.Matrix
 import com.ameen.photoscan.data.Keyframe
@@ -29,6 +28,10 @@ object Pipeline {
     /**
      * Runs the whole reconstruction on the calling thread, which must not be the main thread.
      * Creates and destroys its own GL context.
+     *
+     * Depth source: plane-sweep multi-view stereo over the captured photographs — classical
+     * photogrammetry, with ARCore's poses standing in for structure-from-motion. Frames without
+     * usable neighbours contribute nothing rather than falling back to sensor depth.
      */
     fun run(project: Project, quality: Quality, emit: (ReconProgress) -> Unit) {
         val started = System.nanoTime()
@@ -75,11 +78,50 @@ object Pipeline {
             tsdf = Tsdf(n, origin, voxel)
             tsdf.allocate()
 
-            keyframes.forEachIndexed { i, kf ->
-                val f = 0.05f + 0.60f * (i.toFloat() / keyframes.size)
-                emit(ReconProgress.Stage("Fusing shot ${i + 1} of ${keyframes.size}", f))
-                integrateOne(project, kf, tsdf, mu)
+            // The photogrammetry core: dense stereo per keyframe, fused into the volume.
+            val intr = rgbIntrinsics(project, keyframes[0])
+            if (intr.w <= 0 || intr.h <= 0) {
+                emit(ReconProgress.Failed("Could not read the captured photos."))
+                return
             }
+            val mvs = Mvs(
+                project, keyframes,
+                intr.w, intr.h, intr.fx, intr.fy, intr.cx, intr.cy,
+                project.roiCenter, project.roiHalf
+            )
+            var matchedFrames = 0
+            var fracSum = 0f
+            try {
+                mvs.prepare()
+                keyframes.forEachIndexed { i, kf ->
+                    val f = 0.05f + 0.60f * (i.toFloat() / keyframes.size)
+                    emit(ReconProgress.Stage("Matching · shot ${i + 1} of ${keyframes.size}", f))
+                    val r = mvs.depthFor(i)
+                    if (r != null && r.validFraction > 0.01f) {
+                        tsdf.integrate(
+                            kf.viewMatrix,
+                            r.fx, r.fy, r.cx, r.cy,
+                            r.depthMm, r.conf, r.w, r.h,
+                            r.rgba, r.w, r.h,
+                            mu, MIN_DEPTH, MAX_DEPTH, MIN_CONF
+                        )
+                        matchedFrames++
+                        fracSum += r.validFraction
+                    }
+                }
+            } finally {
+                mvs.release()
+            }
+            if (matchedFrames < 4) {
+                emit(ReconProgress.Failed(
+                    "Photo-consistency matched almost nothing across ${keyframes.size} shots. " +
+                        "The subject needs visible surface texture and steady light — " +
+                        "plain, shiny or transparent surfaces cannot be triangulated from photos."
+                ))
+                return
+            }
+            val avgPct = (fracSum / matchedFrames * 100).toInt()
+            emit(ReconProgress.Stage("Matched $matchedFrames shots · $avgPct% pixel coverage", 0.66f))
 
             emit(ReconProgress.Stage("Building surface", 0.68f))
             mesher = Mesher(tsdf)
@@ -129,7 +171,27 @@ object Pipeline {
             mesher?.release()
             tsdf?.release()
             egl.release()
+            neural?.close()
         }
+    }
+
+    // ---------------------------------------------------------------------
+
+    private data class RgbIntr(
+        val w: Int, val h: Int, val fx: Float, val fy: Float, val cx: Float, val cy: Float
+    )
+
+    /** RGB-image intrinsics, deriving them from depth intrinsics + JPEG bounds for old scans. */
+    private fun rgbIntrinsics(p: Project, kf: Keyframe): RgbIntr {
+        if (kf.rgbWidth > 0 && kf.rgbHeight > 0 && kf.rgbFx > 0f) {
+            return RgbIntr(kf.rgbWidth, kf.rgbHeight, kf.rgbFx, kf.rgbFy, kf.rgbCx, kf.rgbCy)
+        }
+        val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(p.rgbFile(kf.index).absolutePath, opts)
+        if (opts.outWidth <= 0 || opts.outHeight <= 0) return RgbIntr(0, 0, 0f, 0f, 0f, 0f)
+        val sx = opts.outWidth.toFloat() / kf.depthWidth
+        val sy = opts.outHeight.toFloat() / kf.depthHeight
+        return RgbIntr(opts.outWidth, opts.outHeight, kf.fx * sx, kf.fy * sy, kf.cx * sx, kf.cy * sy)
     }
 
     // ---------------------------------------------------------------------
@@ -155,7 +217,7 @@ object Pipeline {
                 val stride = max(1, total / 1200)
                 var k = 0
                 while (k < total && k < depth.size) {
-                    val raw = depth[k].toInt() and 0x1FFF
+                    val raw = depth[k].toInt() and 0xFFFF
                     val c = conf?.getOrNull(k)?.toInt()?.and(0xFF) ?: 255
                     if (raw != 0 && c > 120) {
                         val d = raw * 0.001f
@@ -187,45 +249,6 @@ object Pipeline {
         val (y0, y1) = trimmed(ys)
         val (z0, z1) = trimmed(zs)
         return floatArrayOf(x0, y0, z0) to floatArrayOf(x1, y1, z1)
-    }
-
-    private fun integrateOne(p: Project, kf: Keyframe, tsdf: Tsdf, mu: Float) {
-        val depth = readShorts(p.depthFile(kf.index)) ?: return
-        val conf = p.confFile(kf.index).takeIf { it.exists() }?.readBytes()
-            ?: ByteArray(kf.depthWidth * kf.depthHeight) { 255.toByte() }
-
-        var rgba: ByteArray? = null
-        var cw = 0; var ch = 0
-        val jpg = p.rgbFile(kf.index)
-        if (jpg.exists()) {
-            val bmp = decodeScaled(jpg, 640)
-            if (bmp != null) {
-                cw = bmp.width; ch = bmp.height
-                val bb = ByteBuffer.allocate(cw * ch * 4).order(ByteOrder.nativeOrder())
-                bmp.copyPixelsToBuffer(bb)
-                rgba = bb.array()
-                bmp.recycle()
-            }
-        }
-
-        tsdf.integrate(
-            kf.viewMatrix, kf.fx, kf.fy, kf.cx, kf.cy,
-            depth, conf, kf.depthWidth, kf.depthHeight,
-            rgba, cw, ch,
-            mu, MIN_DEPTH, MAX_DEPTH, MIN_CONF
-        )
-    }
-
-    private fun decodeScaled(f: File, maxDim: Int): Bitmap? {
-        val probe = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(f.absolutePath, probe)
-        var sample = 1
-        while (max(probe.outWidth, probe.outHeight) / sample > maxDim) sample *= 2
-        val opts = BitmapFactory.Options().apply {
-            inSampleSize = sample
-            inPreferredConfig = Bitmap.Config.ARGB_8888
-        }
-        return BitmapFactory.decodeFile(f.absolutePath, opts)
     }
 
     private fun readShorts(f: File): ShortArray? {
@@ -287,14 +310,14 @@ object Pipeline {
             val a = mesh.indices[i]
             if (find(a) in keepRoots) {
                 for (k in 0..2) {
-                    val v = mesh.indices[i + k]
-                    var m = remap[v]
+                    val vI = mesh.indices[i + k]
+                    var m = remap[vI]
                     if (m < 0) {
                         m = pos.size / 3
-                        remap[v] = m
-                        pos.add(mesh.positions[v * 3]); pos.add(mesh.positions[v * 3 + 1]); pos.add(mesh.positions[v * 3 + 2])
-                        nrm.add(mesh.normals[v * 3]); nrm.add(mesh.normals[v * 3 + 1]); nrm.add(mesh.normals[v * 3 + 2])
-                        col.add(mesh.colors[v * 3]); col.add(mesh.colors[v * 3 + 1]); col.add(mesh.colors[v * 3 + 2])
+                        remap[vI] = m
+                        pos.add(mesh.positions[vI * 3]); pos.add(mesh.positions[vI * 3 + 1]); pos.add(mesh.positions[vI * 3 + 2])
+                        nrm.add(mesh.normals[vI * 3]); nrm.add(mesh.normals[vI * 3 + 1]); nrm.add(mesh.normals[vI * 3 + 2])
+                        col.add(mesh.colors[vI * 3]); col.add(mesh.colors[vI * 3 + 1]); col.add(mesh.colors[vI * 3 + 2])
                     }
                     idx.add(m)
                 }
