@@ -82,6 +82,10 @@ class Project(val dir: File) {
     var triangleCount: Int = 0
     var quality: Quality = Quality.BALANCED
 
+    /** Scan volume anchored during capture: world-space centre and half edge length, metres. */
+    var roiCenter: FloatArray? = null
+    var roiHalf: Float = 0f
+
     fun rgbFile(i: Int) = File(dir, "rgb_%04d.jpg".format(i))
     fun depthFile(i: Int) = File(dir, "depth_%04d.bin".format(i))
     fun confFile(i: Int) = File(dir, "conf_%04d.bin".format(i))
@@ -96,6 +100,13 @@ class Project(val dir: File) {
         root.put("createdAt", createdAt)
         root.put("quality", quality.name)
         root.put("triangleCount", triangleCount)
+        roiCenter?.let { c ->
+            if (roiHalf > 0f) {
+                root.put("roi", JSONArray()
+                    .put(c[0].toDouble()).put(c[1].toDouble()).put(c[2].toDouble())
+                    .put(roiHalf.toDouble()))
+            }
+        }
         val arr = JSONArray()
         keyframes.forEach { arr.put(it.toJson()) }
         root.put("keyframes", arr)
@@ -111,6 +122,14 @@ class Project(val dir: File) {
             createdAt = root.optLong("createdAt", createdAt)
             quality = runCatching { Quality.valueOf(root.optString("quality")) }.getOrDefault(Quality.BALANCED)
             triangleCount = root.optInt("triangleCount", 0)
+            root.optJSONArray("roi")?.let { a ->
+                if (a.length() == 4) {
+                    roiCenter = floatArrayOf(
+                        a.getDouble(0).toFloat(), a.getDouble(1).toFloat(), a.getDouble(2).toFloat()
+                    )
+                    roiHalf = a.getDouble(3).toFloat()
+                }
+            }
             val arr = root.getJSONArray("keyframes")
             List(arr.length()) { Keyframe.fromJson(arr.getJSONObject(it)) }.also { keyframeCount = it.size }
         } catch (t: Throwable) {
