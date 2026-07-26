@@ -32,6 +32,8 @@ class Mesher(private val tsdf: Tsdf) {
 
     private val src = """
         #version 310 es
+        precision highp float;
+        precision highp int;
         layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
         layout(std430, binding = 0) readonly  buffer Tsdf    { uint d[]; } vol;
@@ -99,17 +101,17 @@ class Mesher(private val tsdf: Tsdf) {
             if (t >= uint(uMaxTris)) return;
             uint base = t * 27u;
             put(base, a);
-            put(base + 9u,  flip ? c : b);
-            put(base + 18u, flip ? b : c);
+            if (flip) { put(base + 9u, c); put(base + 18u, b); }
+            else      { put(base + 9u, b); put(base + 18u, c); }
         }
 
-        // Six tetrahedra sharing the cube diagonal 0-7, one per axis permutation.
-        const int TETS[24] = int[24](
-            0,1,3,7,  0,1,5,7,  0,2,3,7,
-            0,2,6,7,  0,4,5,7,  0,4,6,7
-        );
-
         void main() {
+            // Six tetrahedra sharing the cube diagonal 0-7, one per axis permutation.
+            int tets[24] = int[24](
+                0,1,3,7,  0,1,5,7,  0,2,3,7,
+                0,2,6,7,  0,4,5,7,  0,4,6,7
+            );
+
             ivec3 g = ivec3(gl_GlobalInvocationID);
             if (g.x >= uN - 1 || g.y >= uN - 1 || g.z >= uZCount) return;
             int z = uZStart + g.z;
@@ -126,17 +128,12 @@ class Mesher(private val tsdf: Tsdf) {
             }
 
             for (int t = 0; t < 6; t++) {
-                int i0 = TETS[t * 4 + 0];
-                int i1 = TETS[t * 4 + 1];
-                int i2 = TETS[t * 4 + 2];
-                int i3 = TETS[t * 4 + 3];
-                int ids[4] = int[4](i0, i1, i2, i3);
-
                 int inside[4]; int outside[4];
                 int ni = 0; int no = 0;
                 for (int k = 0; k < 4; k++) {
-                    if (val[ids[k]] < 0.0) { inside[ni++] = ids[k]; }
-                    else { outside[no++] = ids[k]; }
+                    int id = tets[t * 4 + k];
+                    if (val[id] < 0.0) { inside[ni] = id; ni++; }
+                    else { outside[no] = id; no++; }
                 }
                 if (ni == 0 || ni == 4) continue;
 
@@ -170,7 +167,7 @@ class Mesher(private val tsdf: Tsdf) {
     """.trimIndent()
 
     fun prepare() {
-        prog = GlUtil.computeProgram(src)
+        prog = GlUtil.computeProgram(src, "surface extraction")
 
         val ids = IntArray(2)
         GLES31.glGenBuffers(2, ids, 0)
