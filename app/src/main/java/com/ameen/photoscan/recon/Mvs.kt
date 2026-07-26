@@ -310,6 +310,7 @@ class Mvs(
         val refGray = grayOf(ref.index, refBmp)
         val rgba = rgbaOf(refBmp)
         refBmp.recycle()
+        if (refGray == null) return null
 
         uploadGray(refTex, refGray)
         val rel = FloatArray(16 * MAX_NEIGHBORS)
