@@ -24,7 +24,7 @@ object Pipeline {
 
     private const val MIN_DEPTH = 0.15f
     private const val MAX_DEPTH = 4.5f
-    private const val MIN_CONF = 0.35f
+    private const val MIN_CONF = 0.25f
 
     /**
      * Runs the whole reconstruction on the calling thread, which must not be the main thread.
@@ -45,11 +45,19 @@ object Pipeline {
             egl.makeCurrent()
 
             emit(ReconProgress.Stage("Measuring the scene", 0.02f))
-            val bounds = estimateBounds(project, keyframes)
-                ?: run {
-                    emit(ReconProgress.Failed("No usable depth data. The scene may be too far away or too dark."))
-                    return
-                }
+            // A scan box anchored during capture is authoritative: it is why a small object gets the
+            // full voxel resolution instead of sharing it with the whole room behind it.
+            val rc = project.roiCenter
+            val bounds = if (rc != null && project.roiHalf > 0f) {
+                val h = project.roiHalf
+                floatArrayOf(rc[0] - h, rc[1] - h, rc[2] - h) to
+                        floatArrayOf(rc[0] + h, rc[1] + h, rc[2] + h)
+            } else {
+                estimateBounds(project, keyframes)
+            } ?: run {
+                emit(ReconProgress.Failed("No usable depth data. The scene may be too far away or too dark."))
+                return
+            }
 
             val (mn, mx) = bounds
             val extent = floatArrayOf(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2])
